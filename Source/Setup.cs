@@ -38,9 +38,8 @@ namespace Celsius
             if (Settings.DebugMode)
                 foreach (TerrainDef def in DefDatabase<TerrainDef>.AllDefs)
                 {
-                    TerrainThermalProperties terrainThermalProps = def.GetTerrainThermalProperties();
-                    if (terrainThermalProps != null)
-                        LogUtility.Log($"Terrain {def.defName}. {terrainThermalProps}");
+                    if (def.Freezable() || def.Meltable())
+                        LogUtility.Log($"Terrain {def.defName}. Tags: {def.tags.ToCommaList()}.");
                 }
 
             TemperatureUtility.SettingsChanged();
@@ -125,16 +124,13 @@ namespace Celsius
         // Replaces GenTemperature.PushHeat(Thing, float) to push heat evenly from big things (e.g. geysers)
         public static bool GenTemperature_PushHeat_Thing(Thing t, float energy)
         {
+            if (t.def.Size.x == 1 && t.def.Size.z == 1)
+                return !TemperatureUtility.TryPushHeat(t.PositionHeld, t.MapHeld, energy);
             TemperatureInfo temperatureInfo = t.MapHeld?.TemperatureInfo();
             if (temperatureInfo == null)
             {
                 LogUtility.Log($"TemperatureInfo unavailable for map {t.MapHeld} where {t} is held!", LogLevel.Warning);
                 return true;
-            }
-            if (t.def.Size == IntVec2.One)
-            {
-                temperatureInfo.PushHeat(t.PositionHeld, energy);
-                return false;
             }
             CellRect cells = t.OccupiedRect();
             energy /= t.def.Size.Area;
@@ -167,7 +163,7 @@ namespace Celsius
         // Disables vanilla snow melting
         public static float SteadyEnvironmentEffects_MeltAmountAt(float result, float temperature) => 0;
 
-        // Attaches to AttachableThing.Destroy to reduce temperature to just below the ignition temperature, when a Fire is destroyed
+        // Attaches to AttachableThing.Destroy to reduce temperature when a Fire is destroyed to the ignition temperature
         public static void AttachableThing_Destroy(AttachableThing __instance)
         {
             if (Settings.AutoignitionEnabled && __instance is Fire)
@@ -175,12 +171,11 @@ namespace Celsius
                 TemperatureInfo temperatureInfo = __instance.Map?.TemperatureInfo();
                 if (temperatureInfo != null)
                 {
-                    int index = __instance.Map.cellIndices.CellToIndex(__instance.Position);
-                    float temperature = temperatureInfo.GetIgnitionTemperatureForCell(index) - 1;
-                    if (temperature < temperatureInfo.GetTemperatureForCell(index))
+                    float temperature = temperatureInfo.GetIgnitionTemperatureForCell(__instance.Position);
+                    if (temperature < temperatureInfo.GetTemperatureForCell(__instance.Position))
                     {
                         LogUtility.Log($"Setting temperature at {__instance.Position} to {temperature:F0}C...");
-                        temperatureInfo.SetTemperatureForCell(index, temperature);
+                        temperatureInfo.SetTemperatureForCell(__instance.Position, temperature);
                     }
                 }
             }
@@ -226,17 +221,14 @@ namespace Celsius
         // Replaces temperature display in the global controls view (bottom right)
         public static bool GlobalControls_TemperatureString(ref string __result)
         {
-            Map map = Find.CurrentMap;
-            if (map == null)
+            IntVec3 cell = UI.MouseCell();
+            TemperatureInfo temperatureInfo = Find.CurrentMap?.TemperatureInfo();
+            if (temperatureInfo == null || !cell.InBounds(Find.CurrentMap) || cell.Fogged(Find.CurrentMap))
                 return true;
-            int index = map.cellIndices.CellToIndex(UI.MouseCell());
-            TemperatureInfo temperatureInfo = map.TemperatureInfo();
-            if (temperatureInfo == null || !temperatureInfo.InBounds(index) || map.fogGrid.IsFogged(index))
-                return true;
-            __result = temperatureInfo.GetTemperatureForCell(index).ToStringTemperature(Settings.TemperatureDisplayFormatString);
+            __result = temperatureInfo.GetTemperatureForCell(cell).ToStringTemperature(Settings.TemperatureDisplayFormatString);
             if (temperatureInfo.HasTerrainTemperatures)
             {
-                float terrainTemperature = temperatureInfo.GetTerrainTemperature(index);
+                float terrainTemperature = temperatureInfo.GetTerrainTemperature(cell);
                 if (!float.IsNaN(terrainTemperature))
                     // Localization Key: Celsius_Terrain - Terrain
                     __result += $" / {"Celsius_Terrain".Translate()} {terrainTemperature.ToStringTemperature(Settings.TemperatureDisplayFormatString)}";
