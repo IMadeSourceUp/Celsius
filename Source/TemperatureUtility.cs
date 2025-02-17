@@ -22,11 +22,9 @@ namespace Celsius
             return temperatureInfo;
         }
 
-        public static void SettingsChanged()
+        internal static void SettingsChanged()
         {
             LogUtility.Log("Mod settings have changed. Updating data.", LogLevel.Important);
-            Settings.RecalculateValues();
-            ThermalProps.Init();
             AccessTools.Field(typeof(SteadyEnvironmentEffects), "AutoIgnitionTemperatureRange").SetValue(null, Settings.AutoignitionEnabled
                 ? new FloatRange(10000, float.MaxValue)
                 : new FloatRange(240, 1000));
@@ -35,14 +33,27 @@ namespace Celsius
             for (int i = 0; i < DefDatabase<ThingDef>.AllDefsListForReading.Count; i++)
                 DefDatabase<ThingDef>.AllDefsListForReading[i].GetModExtension<ThingThermalProperties>()?.Reset();
 
-            // Resetting maps' temperature info cache and trying to re-initialize terrain temperatures
-            if (temperatureInfos != null)
-                foreach (TemperatureInfo temperatureInfo in temperatureInfos.Values)
+            // Resetting maps' temperature info cache and re-initializing terrain temperatures
+            if (Find.Maps != null)
+                for (int m = 0; m < Find.Maps.Count; m++)
                 {
+                    TemperatureInfo temperatureInfo = Find.Maps[m].TemperatureInfo();
+                    if (temperatureInfo == null)
+                        continue;
                     temperatureInfo.ResetAllThings();
                     if (Settings.FreezingAndMeltingEnabled && !temperatureInfo.HasTerrainTemperatures)
                         temperatureInfo.InitializeTerrainTemperatures();
                 }
+
+            RefreshAllMaps();
+        }
+
+        public static void RefreshAllMaps()
+        {
+            foreach (var temperatureInfo in TemperatureUtility.temperatureInfos)
+            {
+                temperatureInfo.Value.SetupStrategy();
+            }
         }
 
         #region TEMPERATURE
@@ -94,53 +105,43 @@ namespace Celsius
 
         #region DIFFUSION
 
-        public static void CalculateHeatTransferCells(float interactingTemperature, ThermalProps props, float airflow, ref float energy, ref float heatFlow, bool log = false)
+        public static void CalculateHeatTransferCells(float homeTemperature, float interactingTemperature, ThermalProps props, float airflow, ref float energy, ref float heatFlow, bool log = false)
         {
             // Air has heat capacity = 1 and conductivity = 1
             if (airflow == 1 && props.IsAir)
             {
+                energy += interactingTemperature - homeTemperature;
                 heatFlow++;
-                energy += interactingTemperature;
                 return;
             }
 
             // If one of the interacting cells is not air, need to take airflow into account
             float hf = airflow == 0 || props.airflow == 0
-                ? props.HeatFlow
-                : props.HeatFlow * Mathf.Pow(Settings.ConvectionConductivityEffect, airflow * props.airflow);
+                ? props.HeatFlowNoConvection
+                : props.HeatFlow * Mathf.Pow(Settings.ConvectionConductivityEffect, airflow * props.airflow - 1);
             if (log)
-                LogUtility.Log($"Interacting temperature: {interactingTemperature:F1}C. Mutual airflow: {airflow * props.airflow}. Heatflow: {hf:F3}.");
+                LogUtility.Log($"Interacting temperature: {interactingTemperature:F1}C. Mutual airflow: {airflow * props.airflow}. Heatflow: {hf}.");
+            energy += (interactingTemperature - homeTemperature) * hf;
             heatFlow += hf;
-            energy += interactingTemperature * hf;
         }
 
-        public static void CalculateHeatTransferTerrain(float terrainTemperature, ThermalProps props, ref float energy, ref float heatFlow)
+        public static void CalculateHeatTransferTerrain(float cellTemperature, float terrainTemperature, ThermalProps props, ref float energy, ref float heatFlow)
         {
-            heatFlow += props.HeatFlow;
-            energy += terrainTemperature * props.HeatFlow;
+            energy += (terrainTemperature - cellTemperature) * props.HeatFlowNoConvection;
+            heatFlow += props.HeatFlowNoConvection;
         }
 
-        public static void CalculateHeatTransferEnvironment(float environmentTemperature, ThermalProps props, RoofDef roof, ref float energy, ref float heatFlow)
+        public static void CalculateHeatTransferEnvironment(float cellTemperature, float environmentTemperature, ThermalProps props, bool roofed, ref float energy, ref float heatFlow)
         {
-            float hf;
-            if (roof == null)
+            if (props.IsAir && !roofed)
             {
-                if (props.IsAir)  // Air-to-air exchange (most common way on most maps)
-                {
-                    heatFlow += Settings.EnvironmentDiffusionFactor;
-                    energy += environmentTemperature * Settings.EnvironmentDiffusionFactor;
-                    return;
-                }
-                // Buildings without a roof
-                hf = Settings.EnvironmentDiffusionFactor * props.HeatFlow;
-                if (props.airflow != 0)
-                    hf *= Mathf.Pow(Settings.ConvectionConductivityEffect, props.airflow);
+                energy += (environmentTemperature - cellTemperature) * Settings.EnvironmentDiffusionFactor;
+                heatFlow += Settings.EnvironmentDiffusionFactor;
+                return;
             }
-            else if (!roof.isThickRoof)  // Thin roof: use insulation value from the settings (precomputed)
-                hf = props.HeatFlow * Settings.RoofDiffusionFactor;
-            else return;  // Thick roof: no heat exchange at all
+            float hf = props.heatflowNoConvection * Settings.RoofDiffusionFactor;
+            energy += (environmentTemperature - cellTemperature) * hf;
             heatFlow += hf;
-            energy += environmentTemperature * hf;
         }
 
         #endregion DIFFUSION
@@ -152,14 +153,40 @@ namespace Celsius
         public static bool TryPushHeat(IntVec3 cell, Map map, float energy)
         {
             TemperatureInfo temperatureInfo = map.TemperatureInfo();
-            int index = map.cellIndices.CellToIndex(cell);
-            if (temperatureInfo == null || !temperatureInfo.InBounds(index))
+            if (temperatureInfo == null || !cell.InBounds(map))
             {
                 LogUtility.Log($"TemperatureInfo for {map} unavailable or cell {cell} is outside map boundaries!", LogLevel.Warning);
                 return false;
             }
-            temperatureInfo.PushHeat(index, energy);
+            temperatureInfo.PushHeat(map.cellIndices.CellToIndex(cell), energy);
             return true;
+        }
+
+        public static float GetAverageSnowDepth(this Map map)
+        {
+            float snowDepth = map.snowGrid.TotalDepth;
+            if (snowDepth <= 0)
+                return 0;
+            int possibleSnowCells = 0;
+            for (int i = 0; i < map.Size.x * map.Size.z; i++)
+            {
+                TerrainDef terrain = map.terrainGrid.TerrainAt(i);
+                if (terrain != null && !terrain.holdSnow)
+                    continue;
+                Building building = map.edificeGrid[i];
+                if (building != null && !SnowGrid.CanCoexistWithSnow(building.def))
+                    continue;
+                if (map.roofGrid.Roofed(i))
+                    continue;
+                possibleSnowCells++;
+            }
+            if (possibleSnowCells > 0)
+            {
+                snowDepth /= possibleSnowCells;
+                LogUtility.Log($"Covering frozen terrain with average snow level of {snowDepth:F4}.");
+                return snowDepth;
+            }
+            return 0;
         }
 
         #endregion MISC UTILITIES
